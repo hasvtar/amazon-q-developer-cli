@@ -1,9 +1,6 @@
-use crossterm::{
-    execute,
-    style,
-};
+use crossterm::{execute, style};
 
-use crate::protocol::Event;
+use crate::protocol::{Event, LegacyPassThroughOutput};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ConduitError {
@@ -33,37 +30,58 @@ impl ViewEnd {
     /// Method to facilitate in the interim
     /// It takes possible messages from the old even loop and queues write to the output provided
     /// This blocks the current thread and consumes the [ViewEnd]
-    pub fn into_legacy_mode(self, mut output: impl std::io::Write) -> Result<(), ConduitError> {
+    pub fn into_legacy_mode(
+        self,
+        mut stderr: std::io::Stderr,
+        mut stdout: std::io::Stdout,
+    ) -> Result<(), ConduitError> {
         while let Ok(event) = self.receiver.recv() {
-            let content = match event {
-                Event::Custom(custom) => custom.value.to_string(),
-                Event::TextMessageContent(content) => content.delta,
-                Event::TextMessageChunk(chunk) => {
-                    if let Some(content) = chunk.delta {
-                        content
-                    } else {
-                        continue;
-                    }
-                },
-                _ => continue,
-            };
-
-            execute!(&mut output, style::Print(content))?;
+            if let Event::LegacyPassThrough(content) = event {
+                match content {
+                    LegacyPassThroughOutput::Stderr(content) => {
+                        let content_as_str = String::from_utf8(content)?;
+                        execute!(&mut stderr, style::Print(content_as_str))?;
+                    },
+                    LegacyPassThroughOutput::Stdout(content) => {
+                        let content_as_str = String::from_utf8(content)?;
+                        execute!(&mut stdout, style::Print(content_as_str))?;
+                    },
+                }
+            }
         }
 
         Ok(())
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum TargetOutput {
+    Stdout,
+    Stderr,
+}
+
 /// This compliments the [ViewEnd]. It can be thought of as the "other end" of a pipe.
 /// The control would own this.
+#[derive(Debug)]
 pub struct ControlEnd {
     pub current_event: Option<Event>,
     /// Used by the control to send state changes to the view
     pub sender: std::sync::mpsc::Sender<Event>,
     /// To receive user input from the view
     // TODO: later on we will need replace this byte array with an actual event type from ACP
-    pub receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub receiver: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    pub target_output: TargetOutput,
+}
+
+impl Clone for ControlEnd {
+    fn clone(&self) -> Self {
+        Self {
+            current_event: self.current_event.clone(),
+            sender: self.sender.clone(),
+            receiver: None,
+            target_output: self.target_output.clone(),
+        }
+    }
 }
 
 impl ControlEnd {
@@ -79,15 +97,19 @@ impl ControlEnd {
     pub fn send(&self, event: Event) -> Result<(), ConduitError> {
         Ok(self.sender.send(event).map_err(Box::new)?)
     }
+
+    pub fn as_stdout(&self) -> Self {
+        let mut self_as_stdout = self.clone();
+        self_as_stdout.target_output = TargetOutput::Stdout;
+
+        self_as_stdout
+    }
 }
 
 impl std::io::Write for ControlEnd {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // We'll default to custom event
-        // This hardly matters because in legacy mode we are simply extracting the bytes and
-        // dumping it to output
         if self.current_event.is_none() {
-            self.current_event.replace(Event::Custom(Default::default()));
+            self.current_event.replace(Event::LegacyPassThrough(Default::default()));
         }
 
         let current_event = self
@@ -117,11 +139,8 @@ impl std::io::Write for ControlEnd {
 ///
 /// # Returns
 /// A tuple containing:
-/// - `ViewEnd<S>`: The view-side endpoint for sending input and receiving state updates
-/// - `ControlEnd<S>`: The control-side endpoint for receiving input and sending state updates
-///
-/// # Type Parameters
-/// - `S`: The state type that implements `ViewState` trait
+/// - `ViewEnd`: The view-side endpoint for sending input and receiving state updates
+/// - `ControlEnd`: The control-side endpoint for receiving input and sending state updates
 pub fn get_conduit_pair() -> (ViewEnd, ControlEnd) {
     let (state_tx, state_rx) = std::sync::mpsc::channel::<Event>();
     let (byte_tx, byte_rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -134,7 +153,8 @@ pub fn get_conduit_pair() -> (ViewEnd, ControlEnd) {
         ControlEnd {
             current_event: None,
             sender: state_tx,
-            receiver: byte_rx,
+            receiver: Some(byte_rx),
+            target_output: TargetOutput::Stderr,
         },
     )
 }
@@ -154,22 +174,10 @@ impl InterimEvent for Event {
         debug_assert!(self.is_compatible_with_legacy_event_loop());
 
         match self {
-            Self::Custom(_custom) => {
-                // custom events are defined in this UI crate
-                // TODO: use an enum as implement AsRef for it
-                // match custom.name.as_str() {
-                //     _ => {},
-                // }
-            },
-            Self::TextMessageContent(msg_content) => {
-                let str = String::from_utf8(content.to_vec())?;
-                msg_content.delta.push_str(&str);
-            },
-            Self::TextMessageChunk(chunk) => {
-                let str = String::from_utf8(content.to_vec())?;
-                if let Some(d) = chunk.delta.as_mut() {
-                    d.push_str(&str);
-                }
+            Self::LegacyPassThrough(buf) => match buf {
+                LegacyPassThroughOutput::Stdout(buf) | LegacyPassThroughOutput::Stderr(buf) => {
+                    buf.extend_from_slice(content);
+                },
             },
             _ => unreachable!(),
         }

@@ -20,168 +20,69 @@ pub mod tool_manager;
 pub mod tools;
 pub mod util;
 use std::borrow::Cow;
-use std::collections::{
-    HashMap,
-    VecDeque,
-};
-use std::io::{
-    IsTerminal,
-    Read,
-    Write,
-};
+use std::collections::{HashMap, VecDeque};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{
-    Duration,
-    Instant,
-};
+use std::time::{Duration, Instant};
 
 use amzn_codewhisperer_client::types::SubscriptionStatus;
-use clap::{
-    Args,
-    CommandFactory,
-    Parser,
-    ValueEnum,
-};
+use chat_cli_ui::conduit::{ControlEnd, ViewEnd, get_conduit_pair};
+use clap::{Args, CommandFactory, Parser, ValueEnum};
 use cli::compact::CompactStrategy;
 use cli::hooks::ToolContext;
-use cli::model::{
-    find_model,
-    get_available_models,
-    select_model,
-};
+use cli::model::{find_model, get_available_models, select_model};
 pub use conversation::ConversationState;
 use conversation::TokenWarningLevel;
-use crossterm::style::{
-    Attribute,
-    Color,
-    Stylize,
-};
-use crossterm::{
-    cursor,
-    execute,
-    queue,
-    style,
-    terminal,
-};
-use eyre::{
-    Report,
-    Result,
-    bail,
-    eyre,
-};
+use crossterm::style::{Attribute, Color, Stylize};
+use crossterm::{cursor, execute, queue, style, terminal};
+use eyre::{Report, Result, bail, eyre};
 use input_source::InputSource;
-use message::{
-    AssistantMessage,
-    AssistantToolUse,
-    ToolUseResult,
-    ToolUseResultBlock,
-};
-use parse::{
-    ParseState,
-    interpret_markdown,
-};
-use parser::{
-    RecvErrorKind,
-    RequestMetadata,
-    SendMessageStream,
-};
+use message::{AssistantMessage, AssistantToolUse, ToolUseResult, ToolUseResultBlock};
+use parse::{ParseState, interpret_markdown};
+use parser::{RecvErrorKind, RequestMetadata, SendMessageStream};
 use regex::Regex;
 use rmcp::model::PromptMessage;
-use spinners::{
-    Spinner,
-    Spinners,
-};
+use spinners::{Spinner, Spinners};
 use thiserror::Error;
 use time::OffsetDateTime;
 use token_counter::TokenCounter;
 use tokio::signal::ctrl_c;
-use tokio::sync::{
-    Mutex,
-    broadcast,
-};
-use tool_manager::{
-    PromptQuery,
-    PromptQueryResult,
-    ToolManager,
-    ToolManagerBuilder,
-};
+use tokio::sync::{Mutex, broadcast};
+use tool_manager::{PromptQuery, PromptQueryResult, ToolManager, ToolManagerBuilder};
 use tools::delegate::status_all_agents;
 use tools::gh_issue::GhIssueContext;
-use tools::{
-    NATIVE_TOOLS,
-    OutputKind,
-    QueuedTool,
-    Tool,
-    ToolSpec,
-};
-use tracing::{
-    debug,
-    error,
-    info,
-    trace,
-    warn,
-};
+use tools::{NATIVE_TOOLS, OutputKind, QueuedTool, Tool, ToolSpec};
+use tracing::{debug, error, info, trace, warn};
 use util::images::RichImageBlock;
 use util::ui::draw_box;
-use util::{
-    animate_output,
-    play_notification_bell,
-};
+use util::{animate_output, play_notification_bell};
 use winnow::Partial;
 use winnow::stream::Offset;
 
-use super::agent::{
-    Agent,
-    DEFAULT_AGENT_NAME,
-    PermissionEvalResult,
-};
+use super::agent::{Agent, DEFAULT_AGENT_NAME, PermissionEvalResult};
 use crate::api_client::model::ToolResultStatus;
-use crate::api_client::{
-    self,
-    ApiClientError,
-};
+use crate::api_client::{self, ApiClientError};
 use crate::auth::AuthError;
 use crate::auth::builder_id::is_idc_user;
 use crate::cli::TodoListState;
 use crate::cli::agent::Agents;
-use crate::cli::chat::checkpoint::{
-    CheckpointManager,
-    truncate_message,
-};
+use crate::cli::chat::checkpoint::{CheckpointManager, truncate_message};
 use crate::cli::chat::cli::SlashCommand;
 use crate::cli::chat::cli::editor::open_editor;
-use crate::cli::chat::cli::prompts::{
-    GetPromptError,
-    PromptsSubcommand,
-};
+use crate::cli::chat::cli::prompts::{GetPromptError, PromptsSubcommand};
 use crate::cli::chat::message::UserMessage;
 use crate::cli::chat::util::sanitize_unicode_tags;
-use crate::cli::experiment::experiment_manager::{
-    ExperimentManager,
-    ExperimentName,
-};
+use crate::cli::experiment::experiment_manager::{ExperimentManager, ExperimentName};
 use crate::database::settings::Setting;
 use crate::os::Os;
 use crate::telemetry::core::{
-    AgentConfigInitArgs,
-    ChatAddedMessageParams,
-    ChatConversationType,
-    MessageMetaTag,
-    RecordUserTurnCompletionArgs,
+    AgentConfigInitArgs, ChatAddedMessageParams, ChatConversationType, MessageMetaTag, RecordUserTurnCompletionArgs,
     ToolUseEventBuilder,
 };
-use crate::telemetry::{
-    ReasonCode,
-    TelemetryResult,
-    get_error_reason,
-};
+use crate::telemetry::{ReasonCode, TelemetryResult, get_error_reason};
 use crate::util::directories::get_shadow_repo_dir;
-use crate::util::{
-    MCP_SERVER_TOOL_DELIMITER,
-    directories,
-    ui,
-};
+use crate::util::{MCP_SERVER_TOOL_DELIMITER, directories, ui};
 
 const LIMIT_REACHED_TEXT: &str = color_print::cstr! { "You've used all your free requests for this month. You have two options:
 1. Upgrade to a paid subscription for increased limits. See our Pricing page for what's included> <blue!>https://aws.amazon.com/q/developer/pricing/</blue!>
@@ -308,13 +209,17 @@ impl ChatArgs {
             agents.trust_all_tools = self.trust_all_tools;
 
             os.telemetry
-                .send_agent_config_init(&os.database, conversation_id.clone(), AgentConfigInitArgs {
-                    agents_loaded_count: md.load_count as i64,
-                    agents_loaded_failed_count: md.load_failed_count as i64,
-                    legacy_profile_migration_executed: md.migration_performed,
-                    legacy_profile_migrated_count: md.migrated_count as i64,
-                    launched_agent: md.launched_agent,
-                })
+                .send_agent_config_init(
+                    &os.database,
+                    conversation_id.clone(),
+                    AgentConfigInitArgs {
+                        agents_loaded_count: md.load_count as i64,
+                        agents_loaded_failed_count: md.load_failed_count as i64,
+                        legacy_profile_migration_executed: md.migration_performed,
+                        legacy_profile_migrated_count: md.migrated_count as i64,
+                        launched_agent: md.launched_agent,
+                    },
+                )
                 .await
                 .map_err(|err| error!(?err, "failed to send agent config init telemetry"))
                 .ok();
@@ -625,6 +530,8 @@ impl From<parser::RecvError> for ChatError {
 }
 
 pub struct ChatSession {
+    pub view_end: Option<ViewEnd>,
+    pub control_end: ControlEnd,
     /// For output read by humans and machine
     pub stdout: std::io::Stdout,
     /// For display output, only read by humans
@@ -688,6 +595,16 @@ impl ChatSession {
             .ok()
             .and_then(|cwd| os.database.get_conversation_by_path(cwd).ok())
             .flatten();
+
+        let (view_end, control_end) = get_conduit_pair();
+
+        tokio::task::spawn_blocking(move || {
+            let stderr = std::io::stderr();
+            let stdout = std::io::stdout();
+            if let Err(e) = view_end.into_legacy_mode(stderr, stdout) {
+                error!("Conduit view end legacy mode exited: {:?}", e);
+            }
+        });
 
         // Only restore conversations where there were actual messages.
         // Prevents edge case where user clears conversation then exits without chatting.
@@ -753,6 +670,8 @@ impl ChatSession {
         });
 
         Ok(Self {
+            view_end: None,
+            control_end,
             stdout,
             stderr,
             initial_input: input,
@@ -2687,10 +2606,14 @@ impl ChatSession {
             )?;
         }
 
+        let output = &mut self.control_end;
+        let mut stdout = output.as_stdout();
+
         loop {
             match rx.recv().await {
                 Some(Ok(msg_event)) => {
                     trace!("Consumed: {:?}", msg_event);
+
                     match msg_event {
                         parser::ResponseEvent::ToolUseStart { name } => {
                             // We need to flush the buffer here, otherwise text will not be
@@ -2702,7 +2625,7 @@ impl ChatSession {
                             // Add Q response prefix before the first assistant text.
                             if !response_prefix_printed && !text.trim().is_empty() {
                                 queue!(
-                                    self.stdout,
+                                    output,
                                     style::SetForegroundColor(Color::Green),
                                     style::Print("> "),
                                     style::SetForegroundColor(Color::Reset)
@@ -2715,7 +2638,7 @@ impl ChatSession {
                             if self.spinner.is_some() {
                                 drop(self.spinner.take());
                                 queue!(
-                                    self.stderr,
+                                    output,
                                     terminal::Clear(terminal::ClearType::CurrentLine),
                                     cursor::MoveToColumn(0),
                                     cursor::Show
@@ -2860,7 +2783,7 @@ impl ChatSession {
                             }];
                             // User hint of what happened
                             let _ = queue!(
-                                self.stdout,
+                                stdout,
                                 style::Print("\n\n"),
                                 style::SetForegroundColor(Color::Yellow),
                                 style::Print(format!(
@@ -2909,20 +2832,22 @@ impl ChatSession {
             if tool_name_being_recvd.is_none() && !buf.is_empty() && self.spinner.is_some() {
                 drop(self.spinner.take());
                 queue!(
-                    self.stderr,
+                    output,
                     terminal::Clear(terminal::ClearType::CurrentLine),
                     cursor::MoveToColumn(0),
                     cursor::Show
                 )?;
             }
 
+            info!("## control end: buf: {:?}", buf);
+
             // Print the response for normal cases
             loop {
                 let input = Partial::new(&buf[offset..]);
-                match interpret_markdown(input, &mut self.stdout, &mut state) {
+                match interpret_markdown(input, &mut *output, &mut state) {
                     Ok(parsed) => {
                         offset += parsed.offset_from(&input);
-                        self.stdout.flush()?;
+                        output.flush()?;
                         state.newline = state.set_newline;
                         state.set_newline = false;
                     },
@@ -2956,12 +2881,12 @@ impl ChatSession {
                     play_notification_bell(tool_uses.is_empty());
                 }
 
-                queue!(self.stderr, style::ResetColor, style::SetAttribute(Attribute::Reset))?;
-                execute!(self.stdout, style::Print("\n"))?;
+                queue!(output, style::ResetColor, style::SetAttribute(Attribute::Reset))?;
+                execute!(stdout, style::Print("\n"))?;
 
                 for (i, citation) in &state.citations {
                     queue!(
-                        self.stdout,
+                        stdout,
                         style::Print("\n"),
                         style::SetForegroundColor(Color::Blue),
                         style::Print(format!("[^{i}]: ")),
@@ -3513,26 +3438,31 @@ impl ChatSession {
             };
 
             os.telemetry
-                .send_record_user_turn_completion(&os.database, conversation_id, result, RecordUserTurnCompletionArgs {
-                    message_ids: mds.iter().map(|md| md.message_id.clone()).collect::<_>(),
-                    request_ids: mds.iter().map(|md| md.request_id.clone()).collect::<_>(),
-                    reason,
-                    reason_desc,
-                    status_code,
-                    time_to_first_chunks_ms: mds
-                        .iter()
-                        .map(|md| md.time_to_first_chunk.map(|d| d.as_secs_f64() * 1000.0))
-                        .collect::<_>(),
-                    chat_conversation_type: md.and_then(|md| md.chat_conversation_type),
-                    assistant_response_length: mds.iter().map(|md| md.response_size as i64).sum(),
-                    message_meta_tags: mds.last().map(|md| md.message_meta_tags.clone()).unwrap_or_default(),
-                    user_prompt_length: mds.first().map(|md| md.user_prompt_length).unwrap_or_default() as i64,
-                    user_turn_duration_seconds,
-                    follow_up_count: mds
-                        .iter()
-                        .filter(|md| matches!(md.chat_conversation_type, Some(ChatConversationType::ToolUse)))
-                        .count() as i64,
-                })
+                .send_record_user_turn_completion(
+                    &os.database,
+                    conversation_id,
+                    result,
+                    RecordUserTurnCompletionArgs {
+                        message_ids: mds.iter().map(|md| md.message_id.clone()).collect::<_>(),
+                        request_ids: mds.iter().map(|md| md.request_id.clone()).collect::<_>(),
+                        reason,
+                        reason_desc,
+                        status_code,
+                        time_to_first_chunks_ms: mds
+                            .iter()
+                            .map(|md| md.time_to_first_chunk.map(|d| d.as_secs_f64() * 1000.0))
+                            .collect::<_>(),
+                        chat_conversation_type: md.and_then(|md| md.chat_conversation_type),
+                        assistant_response_length: mds.iter().map(|md| md.response_size as i64).sum(),
+                        message_meta_tags: mds.last().map(|md| md.message_meta_tags.clone()).unwrap_or_default(),
+                        user_prompt_length: mds.first().map(|md| md.user_prompt_length).unwrap_or_default() as i64,
+                        user_turn_duration_seconds,
+                        follow_up_count: mds
+                            .iter()
+                            .filter(|md| matches!(md.chat_conversation_type, Some(ChatConversationType::ToolUse)))
+                            .count() as i64,
+                    },
+                )
                 .await
                 .ok();
         }
@@ -3715,6 +3645,31 @@ fn does_input_reference_file(input: &str) -> Option<ChatState> {
     }
 
     None
+}
+
+// Helper method to save the agent config to file
+async fn save_agent_config(os: &mut Os, config: &Agent, agent_name: &str, is_global: bool) -> Result<(), ChatError> {
+    let config_dir = if is_global {
+        directories::chat_global_agent_path(os)
+            .map_err(|e| ChatError::Custom(format!("Could not find global agent directory: {}", e).into()))?
+    } else {
+        directories::chat_local_agent_dir(os)
+            .map_err(|e| ChatError::Custom(format!("Could not find local agent directory: {}", e).into()))?
+    };
+
+    tokio::fs::create_dir_all(&config_dir)
+        .await
+        .map_err(|e| ChatError::Custom(format!("Failed to create config directory: {}", e).into()))?;
+
+    let config_file = config_dir.join(format!("{}.json", agent_name));
+    let config_json = serde_json::to_string_pretty(config)
+        .map_err(|e| ChatError::Custom(format!("Failed to serialize agent config: {}", e).into()))?;
+
+    tokio::fs::write(&config_file, config_json)
+        .await
+        .map_err(|e| ChatError::Custom(format!("Failed to write agent config file: {}", e).into()))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4182,10 +4137,7 @@ mod tests {
     async fn test_tool_hook_integration() {
         use std::collections::HashMap;
 
-        use crate::cli::agent::hook::{
-            Hook,
-            HookTrigger,
-        };
+        use crate::cli::agent::hook::{Hook, HookTrigger};
 
         let mut os = Os::new().await.unwrap();
         os.client.set_mock_output(serde_json::json!([
@@ -4224,23 +4176,29 @@ mod tests {
         let pre_hook_command = format!("cat > {}", pre_hook_log_path);
         let post_hook_command = format!("cat > {}", post_hook_log_path);
 
-        hooks.insert(HookTrigger::PreToolUse, vec![Hook {
-            command: pre_hook_command,
-            timeout_ms: 5000,
-            max_output_size: 1024,
-            cache_ttl_seconds: 0,
-            matcher: Some("fs_*".to_string()), // Match fs_read, fs_write, etc.
-            source: crate::cli::agent::hook::Source::Agent,
-        }]);
+        hooks.insert(
+            HookTrigger::PreToolUse,
+            vec![Hook {
+                command: pre_hook_command,
+                timeout_ms: 5000,
+                max_output_size: 1024,
+                cache_ttl_seconds: 0,
+                matcher: Some("fs_*".to_string()), // Match fs_read, fs_write, etc.
+                source: crate::cli::agent::hook::Source::Agent,
+            }],
+        );
 
-        hooks.insert(HookTrigger::PostToolUse, vec![Hook {
-            command: post_hook_command,
-            timeout_ms: 5000,
-            max_output_size: 1024,
-            cache_ttl_seconds: 0,
-            matcher: Some("fs_*".to_string()), // Match fs_read, fs_write, etc.
-            source: crate::cli::agent::hook::Source::Agent,
-        }]);
+        hooks.insert(
+            HookTrigger::PostToolUse,
+            vec![Hook {
+                command: post_hook_command,
+                timeout_ms: 5000,
+                max_output_size: 1024,
+                cache_ttl_seconds: 0,
+                matcher: Some("fs_*".to_string()), // Match fs_read, fs_write, etc.
+                source: crate::cli::agent::hook::Source::Agent,
+            }],
+        );
 
         let agent = Agent {
             name: "TestAgent".to_string(),
@@ -4327,10 +4285,7 @@ mod tests {
     async fn test_pretool_hook_blocking_integration() {
         use std::collections::HashMap;
 
-        use crate::cli::agent::hook::{
-            Hook,
-            HookTrigger,
-        };
+        use crate::cli::agent::hook::{Hook, HookTrigger};
 
         let mut os = Os::new().await.unwrap();
 
@@ -4369,14 +4324,17 @@ mod tests {
         #[cfg(windows)]
         let hook_command = "echo Security policy violation: cannot read sensitive files 1>&2 & exit /b 2";
 
-        hooks.insert(HookTrigger::PreToolUse, vec![Hook {
-            command: hook_command.to_string(),
-            timeout_ms: 5000,
-            max_output_size: 1024,
-            cache_ttl_seconds: 0,
-            matcher: Some("fs_read".to_string()),
-            source: crate::cli::agent::hook::Source::Agent,
-        }]);
+        hooks.insert(
+            HookTrigger::PreToolUse,
+            vec![Hook {
+                command: hook_command.to_string(),
+                timeout_ms: 5000,
+                max_output_size: 1024,
+                cache_ttl_seconds: 0,
+                matcher: Some("fs_read".to_string()),
+                source: crate::cli::agent::hook::Source::Agent,
+            }],
+        );
 
         let agent = Agent {
             name: "SecurityAgent".to_string(),
@@ -4436,29 +4394,4 @@ mod tests {
             assert_eq!(actual, *expected, "expected {} for input {}", expected, input);
         }
     }
-}
-
-// Helper method to save the agent config to file
-async fn save_agent_config(os: &mut Os, config: &Agent, agent_name: &str, is_global: bool) -> Result<(), ChatError> {
-    let config_dir = if is_global {
-        directories::chat_global_agent_path(os)
-            .map_err(|e| ChatError::Custom(format!("Could not find global agent directory: {}", e).into()))?
-    } else {
-        directories::chat_local_agent_dir(os)
-            .map_err(|e| ChatError::Custom(format!("Could not find local agent directory: {}", e).into()))?
-    };
-
-    tokio::fs::create_dir_all(&config_dir)
-        .await
-        .map_err(|e| ChatError::Custom(format!("Failed to create config directory: {}", e).into()))?;
-
-    let config_file = config_dir.join(format!("{}.json", agent_name));
-    let config_json = serde_json::to_string_pretty(config)
-        .map_err(|e| ChatError::Custom(format!("Failed to serialize agent config: {}", e).into()))?;
-
-    tokio::fs::write(&config_file, config_json)
-        .await
-        .map_err(|e| ChatError::Custom(format!("Failed to write agent config file: {}", e).into()))?;
-
-    Ok(())
 }
